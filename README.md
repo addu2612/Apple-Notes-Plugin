@@ -46,6 +46,7 @@ Save a summary of this debugging session in my Work folder as "Auth bug postmort
 Add a "Next steps" section to my "v2 Launch Plan" note.
 Make a note called "Bug 412" with this screenshot: ~/Desktop/error.png
 Look at the diagram in my "Architecture" note and explain it.
+Export my "Q3 plan" note as a Word file.
 ```
 
 ## Why this one
@@ -59,9 +60,9 @@ This plugin does those three things very well, and nothing that could hurt your 
 | 🛡️ **Safety** | No delete tool exists. Every edit is backed up first. Notes with images or files are never rewritten. |
 | 🔍 **Search** | Typo-tolerant and order-free: `stagng deploy` finds *Deploy steps for staging*. Titles first, then the text inside notes. |
 | 🖼️ **Images** | Your AI sees the screenshots and diagrams in a note, not just the text around them. |
-| 🪶 **Tokens** | Six tools, about 1,200 tokens of context. Search returns short snippets, not whole notes. |
+| 🪶 **Tokens** | Seven tools, about 1,500 tokens of context. Search returns short snippets, not whole notes. |
 | 🔒 **Privacy** | Runs entirely on your Mac. No network calls, no accounts, no telemetry. Locked notes stay hidden, and you choose [which notes your AI never sees](#keep-notes-away-from-your-ai). |
-| 📄 **Trust** | One file of about 650 lines, zero dependencies. Read every line that touches your notes in a few minutes. |
+| 📄 **Trust** | One file of about 970 lines, zero dependencies. Read every line that touches your notes in a few minutes. |
 
 **Fast, too.** A search across about 270 notes, titles and text, takes about half a second.
 
@@ -104,6 +105,7 @@ Exact config file locations for each tool are in [Connect your AI tool](docs/cli
 | **`list_folders`** | Shows every folder and how many notes it holds, so your AI knows where to put things.          |
 | **`create_note`**  | Writes a new note from Markdown, with images from your Mac.                                    |
 | **`update_note`**  | Adds to the end of a note, or replaces its content. Backs up the old version first.            |
+| **`export_note`**  | Saves a note as a Word `.docx` file, with its images, lists and tables. Notes only exports PDF. |
 | **`health`**       | Checks access to Notes, and counts notes per account, including how many are hidden.           |
 
 Full inputs and outputs are in the [tools reference](docs/tools.md).

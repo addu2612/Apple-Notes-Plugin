@@ -7,6 +7,7 @@
 | [`list_folders`](#list_folders) | Lists every folder and how many notes it holds            |       No       |
 | [`create_note`](#create_note)   | Creates a new note from Markdown                          |      Yes       |
 | [`update_note`](#update_note)   | Adds to the end of a note, or replaces its content        |      Yes       |
+| [`export_note`](#export_note)   | Saves a note as a Word `.docx` file                       |       No       |
 | [`health`](#health)             | Checks access to Notes and counts notes                   |       No       |
 
 There is no delete tool, on purpose.
@@ -91,6 +92,27 @@ If the folder name exists in more than one place, for example *Notes* in both iC
 
 Before each edit, the old note is saved to `~/.apple-notes-mcp/backups/`. To restore one, open the `.html` file in a browser and copy the content back into Notes.
 
+## `export_note`
+
+Saves one note as a Word `.docx` file on your Mac. Notes itself can export only PDF.
+
+| Input   | Description                                                                                           |
+| ------- | ----------------------------------------------------------------------------------------------------- |
+| `id`    | Note id from `search_notes`. Exact.                                                                    |
+| `title` | Used when there is no `id`. Same rules as `get_note`: equally good matches are refused.               |
+| `to`    | A folder, where the file is named after the note, or a full path ending in `.docx`. Default `~/Downloads`. Use an absolute path or `~/`. |
+
+The file keeps the note's headings, bold, italic, underline, strikethrough, monospaced text, links, bulleted and numbered lists (nested too) and tables.
+**Images are embedded.** PNG, JPEG and GIF go in as they are. TIFF and HEIC are converted to PNG with `sips`, which is built into macOS. Wide images are scaled to fit the page.
+An image that Notes cannot hand over shows as `[image N could not be exported]`, and the result has `images_failed` and a `warning`. Other attachments, such as PDFs, show as `[attachment]`.
+
+- **Nothing is overwritten.** If the name is taken in a folder, the file gets ` (2)`, ` (3)` and so on. A full path that already exists is refused.
+- **The note is not changed.**
+- **Hidden and locked notes are refused,** as for `get_note`.
+
+The result has `file` (the path), `bytes` and `images_embedded`.
+The plugin builds the `.docx` itself with Node's built-in zip compression. It needs no Word, no Pages and no extra packages.
+
 ## `health`
 
 Takes no input. Call it when a search returns nothing that should exist, or when a call fails.
@@ -150,6 +172,7 @@ npx -y apple-notes-plugin search "" --folder Work                 # recent notes
 npx -y apple-notes-plugin search "invoice" --titles-only          # skip the text inside notes
 npx -y apple-notes-plugin folders                                 # every folder, with note counts
 npx -y apple-notes-plugin health                                  # access check and note counts
+npx -y apple-notes-plugin export "launch plan" --to ~/Desktop       # save as Word, with images
 npx -y apple-notes-plugin get "launch plan"                       # best title match, as Markdown
 npx -y apple-notes-plugin get "x-coredata://…/ICNote/p123" --format text
 npx -y apple-notes-plugin create "Deploy checklist" --content "- run migrations

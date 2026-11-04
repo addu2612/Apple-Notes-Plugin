@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 // Apple Notes search, read and write for any AI tool. No delete.
 // - No args: runs as an MCP server over stdio (Claude Code, Cursor, Codex, ...).
-// - `search` / `get` / `folders` / `create` / `update` / `health`: CLI for agents that only have a shell.
+// - `search` / `get` / `folders` / `create` / `update` / `export` / `health`: CLI for agents that only have a shell.
 // Zero dependencies. macOS only (talks to Notes through osascript/JXA).
 
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createInterface } from "node:readline";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { deflateRawSync } from "node:zlib";
 
 const SERVER = { name: "apple-notes", version: "0.1.0" };
 const PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -253,10 +254,13 @@ const decode = (s) => s.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);?/
   e[0] === "#" ? String.fromCodePoint(e[1].toLowerCase() === "x" ? parseInt(e.slice(2), 16) : +e.slice(1))
     : ENTITIES[e.toLowerCase()]);
 
+// Notes wraps each table in <object>. Keep tables; any other <object> is a file attachment.
+const unwrapObjects = (s) => s.replace(/<object\b[^>]*>([\s\S]*?)<\/object>/gi, (_, inner) => /<table\b/i.test(inner) ? inner : "[attachment]");
+
 function htmlToMarkdown(html) {
   let s = String(html).replace(/[\r\n]/g, ""); // Notes marks lines with <div>/<br>; raw newlines mean nothing
   let img = 0; // numbered so the AI can match each [image N] to the N-th image get_note returns
-  s = s.replace(/<img\b[^>]*>/gi, () => `[image ${++img}]`).replace(/<object\b[\s\S]*?<\/object>/gi, "[attachment]");
+  s = unwrapObjects(s.replace(/<img\b[^>]*>/gi, () => `[image ${++img}]`));
   // Notes stores Title/Heading as bold text with a font size, and code as Courier.
   s = s.replace(/<div>\s*<b>\s*<span style="font-size: (\d+)px">([\s\S]*?)<\/span>\s*<\/b>\s*(?:<br>)?\s*<\/div>/gi, (m, px, t) =>
     +px >= 24 ? `<h1>${t}</h1>` : +px >= 18 ? `<h2>${t}</h2>` : m);
@@ -267,7 +271,12 @@ function htmlToMarkdown(html) {
   s = s.replace(/<\/?(b|strong)\b[^>]*>/gi, "**").replace(/<\/?(i|em)\b[^>]*>/gi, "_").replace(/<\/?(strike|s|del)\b[^>]*>/gi, "~~");
   s = s.replace(/<ol\b[^>]*>([\s\S]*?)<\/ol>/gi, (_, inner) => inner.replace(/<li\b[^>]*>/gi, "\n1. "));
   s = s.replace(/<li\b[^>]*>/gi, "\n- ");
-  s = s.replace(/<tr\b[^>]*>/gi, "\n|").replace(/<\/td>/gi, " |").replace(/<td\b[^>]*>/gi, " ");
+  s = s.replace(/<table\b[\s\S]*?<\/table>/gi, (t) => { // one Markdown row per <tr>; Notes puts a <div> in each cell
+    const rows = [...t.matchAll(/<tr\b[\s\S]*?<\/tr>/gi)].map(([r]) => [...r.matchAll(/<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi)]
+      .map(([, c]) => decode(c.replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim().replace(/\|/g, "\\|")));
+    const cols = Math.max(1, ...rows.map((r) => r.length)), line = (r) => `| ${Array.from({ length: cols }, (_, i) => r[i] ?? "").join(" | ")} |`;
+    return rows.length ? `\n${[line(rows[0]), line(Array(cols).fill("---")), ...rows.slice(1).map(line)].join("\n")}\n` : "";
+  });
   s = s.replace(/<br\s*\/?>/gi, "\n").replace(/<\/(div|p|ul|ol|table|tr)>/gi, "\n");
   s = decode(s.replace(/<[^>]+>/g, ""));
   s = s.replace(/\*\*(\s*)\*\*/g, "$1").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
@@ -281,7 +290,8 @@ const noteImages = (html) => [...String(html).matchAll(/<img\b[^>]*>/gi)].map(([
   return m ? { mimeType: m[1], data: m[2].replace(/\s/g, "") } : null;
 });
 
-async function getNote({ id, title, format = "markdown", max_images = 5 } = {}) {
+// Finds one note by id or by title and reads it, refusing hidden, locked and ambiguous notes.
+async function readVisibleNote({ id, title }) {
   if (!id && !title) throw new Error("Pass `id` (from search_notes) or `title`.");
   if (!id) {
     const { results } = await searchNotes({ query: title, limit: 5, search_text: false });
@@ -298,6 +308,11 @@ async function getNote({ id, title, format = "markdown", max_images = 5 } = {}) 
   const n = await readNote(id);
   if (n.locked) throw new Error("This note is locked. Locked notes cannot be read.");
   if (isPrivate(n.text)) throw new Error("This note is hidden from AI tools by its owner (#private tag or an excluded folder).");
+  return { meta, n };
+}
+
+async function getNote({ id, title, format = "markdown", max_images = 5 } = {}) {
+  const { meta, n } = await readVisibleNote({ id, title });
   const content = format === "text" ? n.text : format === "html" ? n.html : htmlToMarkdown(n.html);
   // html already carries the images inline, so they are not sent twice.
   const all = format === "html" ? [] : noteImages(n.html);
@@ -467,6 +482,296 @@ async function health() {
   return out;
 }
 
+// ---------- Export: Apple Notes HTML -> Word .docx ----------
+// Notes exports only PDF, and macOS's textutil drops images from .docx. So the .docx is built here:
+// it is a zip of a few XML files, written with Node's built-in zlib.
+
+const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
+  for (let k = 0; k < 8; k++) n = n & 1 ? 0xedb88320 ^ (n >>> 1) : n >>> 1;
+  return n >>> 0;
+});
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (const b of buf) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+// Minimal zip: each file deflated, then the central directory. Dates are fixed at 1980-01-01.
+function zip(files) {
+  const parts = [], central = [];
+  let offset = 0;
+  for (const [name, content] of files) {
+    const data = Buffer.isBuffer(content) ? content : Buffer.from(content, "utf8");
+    const packed = deflateRawSync(data), nameBuf = Buffer.from(name), crc = crc32(data);
+    const local = Buffer.alloc(30), entry = Buffer.alloc(46);
+    local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4); local.writeUInt16LE(0x0800, 6);
+    local.writeUInt16LE(8, 8); local.writeUInt16LE(33, 12); local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(packed.length, 18); local.writeUInt32LE(data.length, 22); local.writeUInt16LE(nameBuf.length, 26);
+    entry.writeUInt32LE(0x02014b50, 0); entry.writeUInt16LE(20, 4); entry.writeUInt16LE(20, 6); entry.writeUInt16LE(0x0800, 8);
+    entry.writeUInt16LE(8, 10); entry.writeUInt16LE(33, 14); entry.writeUInt32LE(crc, 16);
+    entry.writeUInt32LE(packed.length, 20); entry.writeUInt32LE(data.length, 24); entry.writeUInt16LE(nameBuf.length, 28);
+    entry.writeUInt32LE(offset, 42);
+    parts.push(local, nameBuf, packed);
+    central.push(entry, nameBuf);
+    offset += 30 + nameBuf.length + packed.length;
+  }
+  const dir = Buffer.concat(central), end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(files.length, 8); end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(dir.length, 12); end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...parts, dir, end]);
+}
+
+const xml = (s) => String(s).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]/g, "")
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+// One image from a note, ready for Word: PNG, JPEG or GIF with its size in pixels.
+// Other formats (TIFF, HEIC) are converted to PNG with sips, which is built into macOS. null if it fails.
+function docxImage(mime, base64) {
+  const dir = mkdtempSync(join(tmpdir(), "apple-notes-export-"));
+  try {
+    let file = join(dir, "image"), ext = { "image/png": "png", "image/jpeg": "jpeg", "image/gif": "gif" }[mime.toLowerCase()];
+    writeFileSync(file, Buffer.from(base64, "base64"));
+    if (!ext) {
+      execFileSync("sips", ["-s", "format", "png", file, "--out", join(dir, "image.png")], { stdio: "ignore" });
+      file = join(dir, "image.png");
+      ext = "png";
+    }
+    const info = execFileSync("sips", ["-g", "pixelWidth", "-g", "pixelHeight", file]).toString();
+    const w = +info.match(/pixelWidth: (\d+)/)?.[1], h = +info.match(/pixelHeight: (\d+)/)?.[1];
+    return w && h ? { data: readFileSync(file), ext, w, h } : null;
+  } catch {
+    return null;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const PAGE_TEXT_WIDTH = 9026; // A4 width minus 1-inch margins, in twentieths of a point
+const MAX_IMAGE_EMU = 5486400; // 6 inches; Word sizes drawings in EMU (914400 per inch, 9525 per pixel)
+
+// Converts the HTML that Notes stores into the body of a Word document.
+// Handles what Notes writes: lines (<div>, <br>), headings, bold, italic, underline, strikethrough,
+// monospaced text, font sizes, links, bulleted and numbered lists (nested), tables and images.
+function htmlToDocx(html) {
+  const rels = [], media = [], lists = [], body = [], listStack = [], tagStack = [];
+  const fmt = { b: 0, i: 0, u: 0, s: 0, code: 0, size: 0, link: null };
+  let para = null, table = null, row = null, cell = null, images = 0, failed = 0;
+  const rel = (type, target, external) => {
+    const id = `rId${rels.length + 3}`; // rId1 and rId2 are styles and numbering
+    rels.push({ id, type, target, external });
+    return id;
+  };
+  const target = () => cell ?? body;
+  const newPara = (extra = {}) => ({ runs: [], ...extra });
+  const flush = () => {
+    if (para && (para.runs.length || para.blank)) target().push(paraXml(para));
+    para = null;
+  };
+  const ensurePara = () => (para ??= newPara());
+
+  function runXml(r) {
+    if (r.br) return "<w:r><w:br/></w:r>";
+    if (r.drawing) return r.drawing;
+    const p = [];
+    if (r.code) p.push('<w:rFonts w:ascii="Menlo" w:hAnsi="Menlo" w:cs="Menlo"/>');
+    if (r.b) p.push("<w:b/>");
+    if (r.i) p.push("<w:i/>");
+    if (r.s) p.push("<w:strike/>");
+    if (r.link) p.push('<w:color w:val="0563C1"/>');
+    if (r.size) p.push(`<w:sz w:val="${Math.round(r.size * 1.5)}"/>`); // px -> half-points
+    if (r.u || r.link) p.push('<w:u w:val="single"/>');
+    return `<w:r>${p.length ? `<w:rPr>${p.join("")}</w:rPr>` : ""}<w:t xml:space="preserve">${xml(r.text)}</w:t></w:r>`;
+  }
+  function paraXml(p) {
+    const pr = [];
+    if (p.style) pr.push(`<w:pStyle w:val="${p.style}"/>`);
+    if (p.list) pr.push(`<w:numPr><w:ilvl w:val="${p.list.level}"/><w:numId w:val="${p.list.num}"/></w:numPr>`);
+    let out = "", i = 0;
+    while (i < p.runs.length) { // consecutive runs of one link share one <w:hyperlink>
+      const link = p.runs[i].link;
+      let j = i;
+      while (j < p.runs.length && p.runs[j].link === link) j++;
+      const runs = p.runs.slice(i, j).map(runXml).join("");
+      out += link ? `<w:hyperlink r:id="${link}">${runs}</w:hyperlink>` : runs;
+      i = j;
+    }
+    return `<w:p>${pr.length ? `<w:pPr>${pr.join("")}</w:pPr>` : ""}${out}</w:p>`;
+  }
+  function imageXml(img) {
+    let cx = img.w * 9525, cy = img.h * 9525;
+    if (cx > MAX_IMAGE_EMU) { cy = Math.round(cy * MAX_IMAGE_EMU / cx); cx = MAX_IMAGE_EMU; }
+    const n = media.length + 1, name = `image${n}.${img.ext}`;
+    media.push([`word/media/${name}`, img.data]);
+    const rid = rel("image", `media/${name}`);
+    return `<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="${cx}" cy="${cy}"/>` +
+      `<wp:docPr id="${n}" name="Picture ${n}"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">` +
+      `<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+      `<pic:nvPicPr><pic:cNvPr id="${n}" name="${name}"/><pic:cNvPicPr/></pic:nvPicPr>` +
+      `<pic:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
+      `<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>` +
+      `</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>`;
+  }
+  function tableXml(t) {
+    const cols = Math.max(1, ...t.rows.map((r) => r.length)), w = Math.floor(PAGE_TEXT_WIDTH / cols);
+    const border = (side) => `<w:${side} w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>`;
+    const rows = t.rows.map((r) => `<w:tr>${Array.from({ length: cols }, (_, i) =>
+      `<w:tc><w:tcPr><w:tcW w:w="${w}" w:type="dxa"/></w:tcPr>${(r[i] ?? []).join("") || "<w:p/>"}</w:tc>`).join("")}</w:tr>`);
+    return `<w:tbl><w:tblPr><w:tblW w:w="${w * cols}" w:type="dxa"/><w:tblBorders>` +
+      ["top", "left", "bottom", "right", "insideH", "insideV"].map(border).join("") +
+      `</w:tblBorders><w:tblLayout w:type="fixed"/></w:tblPr><w:tblGrid>${`<w:gridCol w:w="${w}"/>`.repeat(cols)}</w:tblGrid>` +
+      `${rows.join("")}</w:tbl><w:p/>`;
+  }
+
+  const src = unwrapObjects(String(html).replace(/[\r\n]/g, ""));
+  for (const token of src.split(/(<[^>]+>)/)) {
+    if (!token) continue;
+    if (token[0] !== "<") {
+      const p = ensurePara();
+      if (p.pendingBreak) { p.runs.push({ br: true }); p.pendingBreak = false; }
+      p.runs.push({ text: decode(token), ...fmt });
+      continue;
+    }
+    const m = token.match(/^<(\/?)([a-z0-9]+)\b([^>]*)>$/i);
+    if (!m) continue;
+    const close = !!m[1], tag = m[2].toLowerCase(), attrs = m[3];
+    if (tag === "div" || tag === "p") {
+      if (close) { if (para && !para.runs.length && para.sawBreak) para.blank = true; flush(); }
+      else if (!para || para.runs.length) { flush(); para = newPara(); }
+    } else if (tag === "br") {
+      const p = ensurePara();
+      p.sawBreak = true;
+      if (p.runs.length) p.pendingBreak = true;
+    } else if (/^h[1-6]$/.test(tag)) {
+      if (close) flush();
+      else {
+        if (para?.runs.length) flush();
+        ensurePara().style = `Heading${Math.min(+tag[1], 3)}`;
+      }
+    } else if (tag === "ul" || tag === "ol") {
+      flush();
+      if (close) listStack.pop();
+      else {
+        lists.push({ ordered: tag === "ol", level: Math.min(listStack.length, 8) });
+        listStack.push(lists.length);
+      }
+    } else if (tag === "li") {
+      flush();
+      if (!close && listStack.length) para = newPara({ list: { num: listStack.at(-1), level: lists[listStack.at(-1) - 1].level } });
+    } else if (tag === "table") {
+      flush();
+      if (close) { if (table) body.push(tableXml(table)); table = null; } else table = { rows: [] };
+    } else if (tag === "tr") {
+      if (close) { if (table && row) table.rows.push(row); row = null; } else row = [];
+    } else if (tag === "td" || tag === "th") {
+      if (close) { flush(); if (row && cell) row.push(cell); cell = null; } else { flush(); cell = []; }
+    } else if (tag === "img") {
+      const d = attrs.match(/src="data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)"/i);
+      const img = d && docxImage(d[1], d[2].replace(/\s/g, ""));
+      images++;
+      flush();
+      if (img) target().push(paraXml({ runs: [{ drawing: imageXml(img) }] }));
+      else { failed++; target().push(paraXml({ runs: [{ text: `[image ${images} could not be exported]` }] })); }
+    } else if (["b", "strong", "i", "em", "u", "strike", "s", "del", "tt", "code"].includes(tag)) {
+      const key = { strong: "b", em: "i", strike: "s", del: "s", tt: "code" }[tag] ?? tag;
+      fmt[key] = Math.max(0, fmt[key] + (close ? -1 : 1));
+    } else if (tag === "a") {
+      const href = attrs.match(/href="([^"]*)"/i)?.[1];
+      fmt.link = !close && href && /^(https?|mailto):/i.test(href) ? rel("hyperlink", decode(href), true) : null;
+    } else if (tag === "span" || tag === "font") {
+      if (close) {
+        const prev = tagStack.pop();
+        if (prev) { fmt.code -= prev.code; fmt.size = prev.size; }
+      } else {
+        const code = /face="[^"]*courier/i.test(attrs) ? 1 : 0, px = attrs.match(/font-size:\s*(\d+)px/i)?.[1];
+        tagStack.push({ code, size: fmt.size });
+        fmt.code += code;
+        if (px) fmt.size = +px;
+      }
+    }
+  }
+  flush();
+  return { body: body.join(""), rels, media, lists, images, failed };
+}
+
+function buildDocx(title, html) {
+  const d = htmlToDocx(html);
+  const W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+  const R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+  const head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+  const levels = (ordered) => Array.from({ length: 9 }, (_, i) =>
+    `<w:lvl w:ilvl="${i}"><w:start w:val="1"/><w:numFmt w:val="${ordered ? "decimal" : "bullet"}"/>` +
+    `<w:lvlText w:val="${ordered ? `%${i + 1}.` : "•"}"/><w:lvlJc w:val="left"/>` +
+    `<w:pPr><w:ind w:left="${720 * (i + 1)}" w:hanging="360"/></w:pPr></w:lvl>`).join("");
+  // One definition per list, so every numbered list starts at 1 in every app, not only in Word.
+  const numbering = `${head}<w:numbering ${W}>` +
+    d.lists.map((l, i) => `<w:abstractNum w:abstractNumId="${i + 1}">${levels(l.ordered)}</w:abstractNum>`).join("") +
+    d.lists.map((_, i) => `<w:num w:numId="${i + 1}"><w:abstractNumId w:val="${i + 1}"/></w:num>`).join("") +
+    "</w:numbering>";
+  const heading = (n, size) => `<w:style w:type="paragraph" w:styleId="Heading${n}"><w:name w:val="heading ${n}"/>` +
+    `<w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before="240" w:after="120"/>` +
+    `<w:outlineLvl w:val="${n - 1}"/></w:pPr><w:rPr><w:b/><w:sz w:val="${size}"/></w:rPr></w:style>`;
+  const styles = `${head}<w:styles ${W}><w:docDefaults><w:rPrDefault><w:rPr>` +
+    `<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:eastAsia="Arial" w:cs="Arial"/><w:sz w:val="22"/>` +
+    `</w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="60"/></w:pPr></w:pPrDefault></w:docDefaults>` +
+    `<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style>` +
+    heading(1, 36) + heading(2, 28) + heading(3, 24) + "</w:styles>";
+  const document = `${head}<w:document ${W} xmlns:r="${R}" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">` +
+    `<w:body>${d.body}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>` +
+    `<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr></w:body></w:document>`;
+  const docRels = `${head}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+    `<Relationship Id="rId1" Type="${R}/styles" Target="styles.xml"/><Relationship Id="rId2" Type="${R}/numbering" Target="numbering.xml"/>` +
+    d.rels.map((r) => `<Relationship Id="${r.id}" Type="${R}/${r.type}" Target="${xml(r.target)}"${r.external ? ' TargetMode="External"' : ""}/>`).join("") +
+    "</Relationships>";
+  const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  const core = `${head}<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" ` +
+    'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">' +
+    `<dc:title>${xml(title)}</dc:title><dcterms:created xsi:type="dcterms:W3CDTF">${now}</dcterms:created>` +
+    `<dcterms:modified xsi:type="dcterms:W3CDTF">${now}</dcterms:modified></cp:coreProperties>`;
+  const ct = "application/vnd.openxmlformats-officedocument.wordprocessingml";
+  const types = `${head}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+    '<Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/>' +
+    '<Default Extension="jpeg" ContentType="image/jpeg"/><Default Extension="gif" ContentType="image/gif"/>' +
+    `<Override PartName="/word/document.xml" ContentType="${ct}.document.main+xml"/>` +
+    `<Override PartName="/word/styles.xml" ContentType="${ct}.styles+xml"/>` +
+    `<Override PartName="/word/numbering.xml" ContentType="${ct}.numbering+xml"/>` +
+    '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/></Types>';
+  const pkgRels = `${head}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+    `<Relationship Id="rId1" Type="${R}/officeDocument" Target="word/document.xml"/>` +
+    '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>' +
+    "</Relationships>";
+  const file = zip([["[Content_Types].xml", types], ["_rels/.rels", pkgRels], ["docProps/core.xml", core],
+    ["word/document.xml", document], ["word/styles.xml", styles], ["word/numbering.xml", numbering],
+    ["word/_rels/document.xml.rels", docRels], ...d.media]);
+  return { file, images: d.images, failed: d.failed };
+}
+
+// Where to save: a folder (the file is named after the note) or a full path ending in .docx.
+// Never overwrites: a taken name in a folder gets " (2)", " (3)" and so on; a taken full path is refused.
+function exportPath(to, title) {
+  const path = String(to).replace(/^~(?=\/|$)/, homedir());
+  if (!isAbsolute(path)) throw new Error(`"${to}": use an absolute path, such as ~/Downloads.`);
+  if (/\.docx$/i.test(path)) {
+    if (existsSync(path)) throw new Error(`${path} already exists. Choose another name; files are never overwritten.`);
+    return path;
+  }
+  if (!existsSync(path)) throw new Error(`Folder not found: ${path}`);
+  const base = String(title).replace(/[\/\\:*?"<>|\u0000-\u001f]/g, "-").replace(/\s+/g, " ").replace(/^[\s.-]+/, "").trim().slice(0, 100) || "Note";
+  for (let i = 1; ; i++) {
+    const file = join(path, `${base}${i > 1 ? ` (${i})` : ""}.docx`);
+    if (!existsSync(file)) return file;
+  }
+}
+
+async function exportNote({ id, title, to = "~/Downloads" } = {}) {
+  const { meta, n } = await readVisibleNote({ id, title });
+  const path = exportPath(to, n.title);
+  const { file, images, failed } = buildDocx(n.title, n.html);
+  writeFileSync(path, file, { flag: "wx" });
+  return { id: n.id, title: n.title, folder: meta.folder, account: meta.account, file: path, bytes: file.length,
+    images_embedded: images - failed, ...(failed ? { images_failed: failed, warning: `${failed} image(s) could not be exported and are marked in the text.` } : {}) };
+}
+
 // ---------- MCP server (JSON-RPC 2.0, newline-delimited over stdio) ----------
 
 const TOOLS = [
@@ -540,6 +845,20 @@ const TOOLS = [
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
   {
+    name: "export_note",
+    title: "Export an Apple Note to Word",
+    description: "Save one Apple Note as a Word .docx file on this Mac, with its images, headings, lists, tables, links and text styles. Notes itself can export only PDF. Pass `id` from search_notes, or `title`. The note is not changed. Existing files are never overwritten. Returns the file path.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Note id from search_notes." },
+        title: { type: "string", description: "Used when id is not given; exports the best title match." },
+        to: { type: "string", default: "~/Downloads", description: "Folder to save into (the file is named after the note), or a full path ending in .docx. Absolute path or ~/." },
+      },
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
     name: "health",
     title: "Check Apple Notes access",
     description: "Check that this plugin can reach Apple Notes. Call it when a search returns nothing that should exist, or when a call fails. Reports macOS permission status, accounts, note counts, and how many notes are hidden by the owner's privacy settings.",
@@ -548,7 +867,7 @@ const TOOLS = [
   },
 ];
 
-const HANDLERS = { search_notes: searchNotes, get_note: getNote, list_folders: listFolders, create_note: createNote, update_note: updateNote, health };
+const HANDLERS = { search_notes: searchNotes, get_note: getNote, list_folders: listFolders, create_note: createNote, update_note: updateNote, export_note: exportNote, health };
 
 async function handle(msg) {
   const { id, method, params = {} } = msg;
@@ -556,7 +875,7 @@ async function handle(msg) {
     case "initialize": {
       const v = PROTOCOLS.includes(params.protocolVersion) ? params.protocolVersion : PROTOCOLS[0];
       return { protocolVersion: v, capabilities: { tools: {} }, serverInfo: SERVER,
-        instructions: "Find notes with search_notes (titles and text), then read one with get_note using the returned id. list_folders shows where notes live. Write with create_note or update_note (needs the id). Notes cannot be deleted. If a note you expect is missing, call health. The owner hides some notes on purpose (#private tag, excluded folders): never try to reach a hidden note another way, such as reading the Notes database or running osascript." };
+        instructions: "Find notes with search_notes (titles and text), then read one with get_note using the returned id. list_folders shows where notes live. Write with create_note or update_note (needs the id). export_note saves a note as a Word file. Notes cannot be deleted. If a note you expect is missing, call health. The owner hides some notes on purpose (#private tag, excluded folders): never try to reach a hidden note another way, such as reading the Notes database or running osascript." };
     }
     case "ping": return {};
     case "tools/list": return { tools: TOOLS };
@@ -602,6 +921,7 @@ const HELP = `Apple Notes for AI tools (macOS)
   apple-notes-plugin folders
   apple-notes-plugin create <title> [--content MARKDOWN] [--folder NAME|PATH] [--account NAME]
   apple-notes-plugin update <id> --content MARKDOWN [--mode append|replace]
+  apple-notes-plugin export <id-or-title> [--to FOLDER|FILE.docx]
   apple-notes-plugin health
 
 Search matches titles first, then note text. --content - reads Markdown from stdin.
@@ -624,6 +944,10 @@ async function cli(argv) {
   else if (cmd === "search") out = await searchNotes({ ...flags, query: pos.join(" "), limit: flags.limit ? +flags.limit : 20 });
   else if (cmd === "folders") out = await listFolders();
   else if (cmd === "health") out = await health();
+  else if (cmd === "export") {
+    const arg = pos.join(" ");
+    out = await exportNote({ to: flags.to, ...(arg.startsWith("x-coredata://") ? { id: arg } : { title: arg }) });
+  }
   else if (cmd === "get") {
     const arg = pos.join(" ");
     const { images, ...note } = await getNote({ format: flags.format, max_images: flags["max-images"] ?? 5,
