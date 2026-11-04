@@ -91,6 +91,8 @@ Any agent that can run shell commands can use the [command-line interface](tools
 
 ## Troubleshooting
 
+Start with `npx -y apple-notes-plugin health` in a terminal, or ask your AI to call `health`. It says whether the plugin can reach Notes, and how many notes are hidden or locked.
+
 **"macOS blocked access to Notes"**
 Open **System Settings → Privacy & Security → Automation**. Find the app that runs the plugin (Terminal, iTerm, Cursor, Codex or Claude). Turn on **Notes**.
 
@@ -99,6 +101,9 @@ Restart the tool after you change its config. Then run `npx -y apple-notes-plugi
 
 **"This note has N attachment(s)"**
 This is a safety rule, not a bug. See [Safety](../README.md#safety).
+
+**A note you know exists is not found**
+Run `health`. The note may be tagged `#private`, sit in a folder listed in `APPLE_NOTES_EXCLUDE`, be locked, or be in a different account than you expect.
 
 **The first call is slow**
 The very first run downloads the plugin, and if Notes is not running, macOS starts it first. That takes a few seconds. Later calls take well under a second.

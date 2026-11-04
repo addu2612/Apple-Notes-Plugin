@@ -59,9 +59,9 @@ This plugin does those three things very well, and nothing that could hurt your 
 | 🛡️ **Safety** | No delete tool exists. Every edit is backed up first. Notes with images or files are never rewritten. |
 | 🔍 **Search** | Typo-tolerant and order-free: `stagng deploy` finds *Deploy steps for staging*. Titles first, then the text inside notes. |
 | 🖼️ **Images** | Your AI sees the screenshots and diagrams in a note, not just the text around them. |
-| 🪶 **Tokens** | Five tools, about 1,000 tokens of context. Search returns short snippets, not whole notes. |
-| 🔒 **Privacy** | Runs entirely on your Mac. No network calls, no accounts, no telemetry. Locked notes stay hidden. |
-| 📄 **Trust** | One file of about 550 lines, zero dependencies. Read every line that touches your notes in a few minutes. |
+| 🪶 **Tokens** | Six tools, about 1,200 tokens of context. Search returns short snippets, not whole notes. |
+| 🔒 **Privacy** | Runs entirely on your Mac. No network calls, no accounts, no telemetry. Locked notes stay hidden, and you choose [which notes your AI never sees](#keep-notes-away-from-your-ai). |
+| 📄 **Trust** | One file of about 650 lines, zero dependencies. Read every line that touches your notes in a few minutes. |
 
 **Fast, too.** A search across about 270 notes, titles and text, takes about half a second.
 
@@ -104,6 +104,7 @@ Exact config file locations for each tool are in [Connect your AI tool](docs/cli
 | **`list_folders`** | Shows every folder and how many notes it holds, so your AI knows where to put things.          |
 | **`create_note`**  | Writes a new note from Markdown, with images from your Mac.                                    |
 | **`update_note`**  | Adds to the end of a note, or replaces its content. Backs up the old version first.            |
+| **`health`**       | Checks access to Notes, and counts notes per account, including how many are hidden.           |
 
 Full inputs and outputs are in the [tools reference](docs/tools.md).
 No MCP in your agent?
@@ -118,7 +119,52 @@ Notes has no undo for changes made by scripts, so the plugin is careful by desig
 - **Exact ids for edits.** `update_note` needs the id from a search. A loose title match can never edit the wrong note.
 - **Attachments are protected.** Editing a note rewrites its whole body, which would remove its images and files. So the plugin refuses to edit notes with attachments.
 - **Locked notes stay private.** They are hidden from search, and their contents are never shown to your AI.
-- **Recently Deleted is read-only.** Nothing there can be edited, and nothing new can be created there.
+- **Recently Deleted is read-only.** Nothing there can be edited, and nothing new can be created there. This works in every macOS language.
+- **No guessing.** If two notes share a title, or two folders share a name, the plugin asks for an exact id or path instead of picking one.
+
+## Keep notes away from your AI
+
+Some notes are not for your AI: health, money, a personal journal on a work laptop.
+Hide them in either of two ways:
+
+- **Tag a note `#private`.** Type `#private` anywhere in the note.
+- **Exclude whole folders.** Set `APPLE_NOTES_EXCLUDE` to a comma-separated list of folder names. Their subfolders are hidden too.
+
+```bash
+claude mcp add --scope user apple-notes -e APPLE_NOTES_EXCLUDE="Personal,Journal" -- npx -y apple-notes-plugin
+```
+
+A hidden note does not appear in search, and it cannot be read or edited.
+Nothing can be created in an excluded folder.
+The server also tells your AI not to reach hidden notes another way.
+`health` shows how many notes are hidden, and lists any excluded name that matches no folder, which catches typos.
+
+This is a filter in the plugin, not encryption.
+For notes that must stay secret from everything, lock them in Notes.
+
+## Make your AI actually use your notes
+
+Connecting the plugin is not enough.
+An AI tool reaches for your notes only when something tells it to, and a general hint such as "check my notes" is usually skipped.
+Name the moments.
+Add a section like this to your project's `CLAUDE.md` or `AGENTS.md`, and fill in your own folder and triggers:
+
+```markdown
+## Apple Notes
+
+Design notes and decisions for this project live in Apple Notes, in the folder `Projects/<this repo>`.
+The `apple-notes` MCP server reaches them.
+
+- Before you change <the database schema>, <the public API> or <the deploy process>,
+  run `search_notes` with `folder: "Projects/<this repo>"` and read what comes back.
+- In your plan, name the notes you relied on. If nothing was found, say so.
+- When you finish a task, append a short entry to the note "<this repo> log" with
+  `update_note`: what changed, what you decided and why, and what is still open.
+- If a search returns nothing that should exist, call `health` before you conclude it is missing.
+```
+
+Three to five specific triggers work better than one general rule.
+The model can match a named action, such as "changing the schema", against the task in front of it.
 
 ## How it works
 

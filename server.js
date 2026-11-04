@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Apple Notes search, read and write for any AI tool. No delete.
 // - No args: runs as an MCP server over stdio (Claude Code, Cursor, Codex, ...).
-// - `search` / `get` / `create` / `update`: CLI for agents that only have a shell.
+// - `search` / `get` / `folders` / `create` / `update` / `health`: CLI for agents that only have a shell.
 // Zero dependencies. macOS only (talks to Notes through osascript/JXA).
 
 import { execFile } from "node:child_process";
@@ -13,8 +13,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SERVER = { name: "apple-notes", version: "0.1.0" };
 const PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const TRASH = "Recently Deleted";
 const BACKUP_DIR = join(homedir(), ".apple-notes-mcp", "backups");
+
+// Privacy: the user can hide notes from AI tools. A hidden note is never listed, read or edited.
+// - Notes tagged #private (anywhere in the text).
+// - Notes in folders named in APPLE_NOTES_EXCLUDE (comma-separated), including their subfolders.
+const PRIVATE_TAG = /(^|[^\p{L}\p{N}_])#private(?![\p{L}\p{N}_-])/iu;
+const EXCLUDE_RAW = (process.env.APPLE_NOTES_EXCLUDE ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 
 // ---------- Notes access (JXA) ----------
 
@@ -34,35 +39,48 @@ function jxa(script, args = []) {
   });
 }
 
-// Every note with title, folder, account and dates, plus every folder with its note count.
-// argv[0] === "text" also reads each unlocked note's plain text, one batched call per folder.
+// Every account, every folder (full path, note count) and every note (title, folder, dates, plain text).
+// Text is read in one batched call per folder, so this stays fast; it is needed to find #private notes.
+// "Recently Deleted" is found by its name in the user's language, taken from Notes' own strings,
+// and only at the top of an account, so a user folder with that name deeper down is not mistaken for it.
 const INDEX_JXA = `
-function run(argv) {
+ObjC.import("Foundation");
+function run() {
   const Notes = Application("Notes");
-  const withText = argv[0] === "text";
-  const out = [], seen = {}, folders = {};
-  function walk(folder, account, path) {
-    const name = path ? path + "/" + folder.name() : folder.name();
-    const ids = folder.notes.id(), titles = folder.notes.name();
-    const mod = folder.notes.modificationDate(), cre = folder.notes.creationDate();
-    const locked = folder.notes.passwordProtected();
-    const text = withText ? folder.notes.plaintext() : null;
-    const fid = folder.id();
-    if (!folders[fid] || name.length > folders[fid].path.length) {
-      folders[fid] = { name: folder.name(), path: name, account: account, notes: ids.length };
-    }
-    for (let i = 0; i < ids.length; i++) {
-      if (seen[ids[i]]) continue;
-      seen[ids[i]] = 1;
-      const note = { id: ids[i], title: titles[i], folder: name, account: account, locked: locked[i],
-        modified: mod[i].toISOString(), created: cre[i].toISOString() };
-      if (withText && !locked[i]) note.text = text[i];
-      out.push(note);
-    }
-    for (const sub of folder.folders()) walk(sub, account, name);
+  const trashNames = ["Recently Deleted"];
+  try {
+    const b = $.NSBundle.bundleWithPath("/System/Library/PrivateFrameworks/NotesShared.framework");
+    if (b) trashNames.push(b.localizedStringForKeyValueTable("Recently Deleted", "Recently Deleted", "Localizable").js);
+  } catch (e) {}
+  const accounts = [], folders = {};
+  // A nested folder can also be listed at the top of its account, so collect each folder once
+  // and build its path from its parent chain, not from the order it was reached in.
+  function collect(f, account) {
+    const id = f.id();
+    if (folders[id]) return;
+    folders[id] = { ref: f, id: id, name: f.name(), account: account, parent: f.container().id() };
+    for (const sub of f.folders()) collect(sub, account);
   }
-  for (const a of Notes.accounts()) for (const f of a.folders()) walk(f, a.name(), "");
-  return JSON.stringify({ notes: out, folders: Object.values(folders) });
+  const defaultAccount = Notes.defaultAccount().name();
+  for (const a of Notes.accounts()) {
+    accounts.push({ name: a.name(), default: a.name() === defaultAccount, default_folder: a.defaultFolder().id() });
+    for (const f of a.folders()) collect(f, a.name());
+  }
+  const pathOf = (x) => folders[x.parent] ? pathOf(folders[x.parent]) + "/" + x.name : x.name;
+  const outFolders = [], notes = [];
+  for (const id in folders) {
+    const x = folders[id], f = x.ref, path = pathOf(x);
+    const trash = !folders[x.parent] && trashNames.indexOf(x.name) >= 0;
+    const ids = f.notes.id(), titles = f.notes.name();
+    const mod = f.notes.modificationDate(), cre = f.notes.creationDate();
+    const locked = f.notes.passwordProtected(), text = f.notes.plaintext();
+    outFolders.push({ id: id, name: x.name, path: path, account: x.account, notes: ids.length, trash: trash });
+    for (let i = 0; i < ids.length; i++) {
+      notes.push({ id: ids[i], title: titles[i], folder: path, account: x.account, locked: locked[i], trash: trash,
+        modified: mod[i].toISOString(), created: cre[i].toISOString(), text: locked[i] ? "" : text[i] });
+    }
+  }
+  return JSON.stringify({ trash_name: trashNames[trashNames.length - 1], accounts: accounts, folders: outFolders, notes: notes });
 }`;
 
 const GET_JXA = `
@@ -74,25 +92,13 @@ function run(argv) {
     modified: n.modificationDate().toISOString(), created: n.creationDate().toISOString() });
 }`;
 
-// argv: folder name ("" = default), account name ("" = any / default), body HTML.
+// argv: folder id (resolved by resolveFolder), body HTML.
 const CREATE_JXA = `
 function run(argv) {
-  const Notes = Application("Notes");
-  const folderName = argv[0].toLowerCase(), accountName = argv[1].toLowerCase();
-  const accounts = Notes.accounts().filter(a => !accountName || a.name().toLowerCase() === accountName);
-  if (!accounts.length) throw new Error("Account not found: " + argv[1] + ". Accounts: " + Notes.accounts().map(a => a.name()).join(", "));
-  let target = null, targetAccount = null, names = [];
-  function walk(f, a) {
-    names.push(a.name() + "/" + f.name());
-    if (!target && f.name().toLowerCase() === folderName && f.name() !== "${TRASH}") { target = f; targetAccount = a; }
-    for (const sub of f.folders()) walk(sub, a);
-  }
-  if (folderName) for (const a of accounts) for (const f of a.folders()) walk(f, a);
-  else { targetAccount = accountName ? accounts[0] : Notes.defaultAccount(); target = targetAccount.defaultFolder(); }
-  if (!target) throw new Error("Folder not found: " + argv[0] + ". Folders: " + names.join(", "));
-  const n = Notes.Note({ body: argv[2] });
+  const target = Application("Notes").folders.byId(argv[0]);
+  const n = Application("Notes").Note({ body: argv[1] });
   target.notes.push(n);
-  return JSON.stringify({ id: n.id(), title: n.name(), folder: target.name(), account: targetAccount.name() });
+  return JSON.stringify({ id: n.id(), title: n.name() });
 }`;
 
 // Passing a file to Notes in any Apple Event lets sandboxed Notes read it until Notes quits.
@@ -111,9 +117,31 @@ function run(argv) {
   return JSON.stringify({ id: n.id(), title: n.name(), modified: n.modificationDate().toISOString() });
 }`;
 
-const readIndex = (withText = false) => jxa(INDEX_JXA, [withText ? "text" : ""]);
-const listNotes = async () => (await readIndex()).notes;
+// A folder path is excluded when any folder on it is named in APPLE_NOTES_EXCLUDE.
+const isExcluded = (path) => String(path).split("/").some((seg) => EXCLUDE_RAW.some((x) => norm(x) === norm(seg)));
+const isPrivate = (text) => PRIVATE_TAG.test(String(text ?? ""));
+
+// Each note gets `hidden` (tagged #private or in an excluded folder). Callers must skip hidden notes.
+async function readIndex() {
+  const index = await jxa(INDEX_JXA);
+  for (const n of index.notes) {
+    n.private = isPrivate(n.text);
+    n.excluded = isExcluded(n.folder);
+    n.hidden = n.private || n.excluded;
+  }
+  for (const f of index.folders) f.excluded = isExcluded(f.path);
+  return index;
+}
+
 const readNote = (id) => jxa(GET_JXA, [id]);
+
+// The index entry for one note, refusing notes the AI tool must not touch.
+function visibleNote(index, id) {
+  const meta = index.notes.find((x) => x.id === id);
+  if (!meta) throw new Error(`No note found for "${id}". Use search_notes to get a valid id.`);
+  if (meta.hidden) throw new Error("This note is hidden from AI tools by its owner (#private tag or an excluded folder).");
+  return meta;
+}
 
 // ---------- Title search ----------
 
@@ -191,14 +219,14 @@ function matchText(text, query) {
 
 async function searchNotes({ query = "", limit = 20, folder, include_deleted = false, search_text = true } = {}) {
   const withText = search_text && !!norm(query);
-  const { notes } = await readIndex(withText);
+  const { notes } = await readIndex();
   const f = folder ? norm(folder) : null;
   const hits = [];
   for (const n of notes) {
-    if (n.locked) continue; // locked notes stay private, titles included
-    if (!include_deleted && n.folder === TRASH) continue;
+    if (n.locked || n.hidden) continue; // locked and hidden notes stay private, titles included
+    if (!include_deleted && n.trash) continue;
     if (f && !norm(n.folder).includes(f)) continue;
-    const { locked, text, ...note } = n;
+    const { locked, text, trash, private: _p, excluded, hidden, ...note } = n;
     const score = scoreTitle(n.title, query);
     if (score) hits.push(withText ? { ...note, matched_in: "title", score } : { ...note, score });
     else if (withText && text) {
@@ -213,7 +241,8 @@ async function searchNotes({ query = "", limit = 20, folder, include_deleted = f
 async function listFolders() {
   const { folders } = await readIndex();
   folders.sort((a, b) => a.account.localeCompare(b.account) || a.path.localeCompare(b.path));
-  return { folders: folders.map((f) => (f.name === TRASH ? { ...f, read_only: true } : f)) };
+  return { folders: folders.filter((f) => !f.excluded)
+    .map(({ id, trash, excluded, ...f }) => (trash ? { ...f, read_only: true } : f)) };
 }
 
 // ---------- Note body: Apple Notes HTML -> Markdown ----------
@@ -254,16 +283,21 @@ const noteImages = (html) => [...String(html).matchAll(/<img\b[^>]*>/gi)].map(([
 
 async function getNote({ id, title, format = "markdown", max_images = 5 } = {}) {
   if (!id && !title) throw new Error("Pass `id` (from search_notes) or `title`.");
-  let match = null;
   if (!id) {
     const { results } = await searchNotes({ query: title, limit: 5, search_text: false });
     if (!results.length) throw new Error(`No note title matches "${title}".`);
-    [match] = results;
-    id = match.id;
+    // Two equally good matches: reading either could be the wrong note, so ask for an id.
+    const tied = results.filter((r) => r.score === results[0].score);
+    if (tied.length > 1) {
+      throw new Error(`${tied.length} notes match "${title}" equally well. Pass one of these ids: ` +
+        tied.map((r) => `${r.id} ("${r.title}" in ${r.account}/${r.folder}, modified ${r.modified.slice(0, 10)})`).join("; "));
+    }
+    id = results[0].id;
   }
+  const meta = visibleNote(await readIndex(), id);
   const n = await readNote(id);
   if (n.locked) throw new Error("This note is locked. Locked notes cannot be read.");
-  const meta = match ?? (await listNotes()).find((x) => x.id === id) ?? {};
+  if (isPrivate(n.text)) throw new Error("This note is hidden from AI tools by its owner (#private tag or an excluded folder).");
   const content = format === "text" ? n.text : format === "html" ? n.html : htmlToMarkdown(n.html);
   // html already carries the images inline, so they are not sent twice.
   const all = format === "html" ? [] : noteImages(n.html);
@@ -353,19 +387,49 @@ function noteBody(title, content = "") {
   return `<div><h1>${inline(title)}</h1></div>\n${markdownToHtml(lines.join("\n"))}`;
 }
 
+// Picks exactly one folder to write into. `folder` is a name or a full path such as Work/Clients.
+// The same name in two places is refused rather than guessed. Recently Deleted and excluded folders are never picked.
+function resolveFolder(index, folder, account) {
+  const accounts = index.accounts.filter((a) => !account || norm(a.name) === norm(account));
+  if (!accounts.length) throw new Error(`Account not found: ${account}. Accounts: ${index.accounts.map((a) => a.name).join(", ")}`);
+  const usable = index.folders.filter((f) => !f.trash && !f.excluded && accounts.some((a) => a.name === f.account));
+  let matches;
+  if (!folder) {
+    const a = account ? accounts[0] : index.accounts.find((x) => x.default) ?? accounts[0];
+    matches = usable.filter((f) => f.id === a.default_folder);
+    if (!matches.length) throw new Error(`The default folder of ${a.name} is excluded. Pass a folder.`);
+  } else {
+    const want = norm(folder).replace(/^\/+|\/+$/g, "");
+    matches = usable.filter((f) => norm(f.path) === want);
+    if (!matches.length) matches = usable.filter((f) => norm(f.name) === want);
+    if (!matches.length) {
+      const trash = index.folders.some((f) => f.trash && norm(f.name) === want);
+      throw new Error(trash ? `Nothing can be created in ${folder}.`
+        : `Folder not found: ${folder}. Folders: ${usable.map((f) => `${f.account}/${f.path}`).join(", ")}`);
+    }
+  }
+  if (matches.length > 1) {
+    throw new Error(`${matches.length} folders are named "${folder}": ${matches.map((f) => `${f.account}/${f.path}`).join(", ")}. Pass \`account\`, or the full path as \`folder\`.`);
+  }
+  return matches[0];
+}
+
 async function createNote({ title, content = "", folder = "", account = "" } = {}) {
   if (!String(title ?? "").trim()) throw new Error("`title` is required.");
+  const target = resolveFolder(await readIndex(), folder, account);
   const body = noteBody(title.trim(), content);
-  return writeWithImages(body, () => jxa(CREATE_JXA, [folder, account, body]));
+  return writeWithImages(body, async () =>
+    ({ ...(await jxa(CREATE_JXA, [target.id, body])), folder: target.path, account: target.account }));
 }
 
 async function updateNote({ id, content, mode = "append" } = {}) {
   if (!id) throw new Error("Pass `id` from search_notes. Updates need an exact id, not a title.");
   if (!String(content ?? "").trim()) throw new Error("`content` is required.");
   if (!["append", "replace"].includes(mode)) throw new Error("`mode` must be append or replace.");
-  const [n, all] = await Promise.all([readNote(id), listNotes()]);
-  if (all.find((x) => x.id === id)?.folder === TRASH) throw new Error("This note is in Recently Deleted. It cannot be edited.");
+  const [n, index] = await Promise.all([readNote(id), readIndex()]);
+  if (visibleNote(index, id).trash) throw new Error("This note is in Recently Deleted. It cannot be edited.");
   if (n.locked) throw new Error("This note is locked. Unlock it in Notes first.");
+  if (isPrivate(n.text)) throw new Error("This note is hidden from AI tools by its owner (#private tag or an excluded folder).");
   if (n.attachments) {
     throw new Error(`This note has ${n.attachments} attachment(s). Editing would remove them, because Notes rewrites the whole body. Create a new note instead, or edit this one in Notes.`);
   }
@@ -374,6 +438,33 @@ async function updateNote({ id, content, mode = "append" } = {}) {
   const backup = join(BACKUP_DIR, `${new Date().toISOString().replace(/[:.]/g, "-")}-${id.split("/").pop()}.html`);
   writeFileSync(backup, n.html);
   return { ...(await writeWithImages(body, () => jxa(SET_BODY_JXA, [id, body]))), mode, backup };
+}
+
+// Tells "nothing matched" apart from "no access", "wrong account" and "hidden by the privacy settings".
+// Never throws: a failure is reported in the result, because that is what the caller needs to see.
+async function health() {
+  const out = { ok: false, version: SERVER.version, node: process.version, backups: BACKUP_DIR,
+    excluded_folders: EXCLUDE_RAW, private_tag: "#private" };
+  try {
+    const index = await readIndex();
+    const count = (pred) => index.notes.filter(pred).length;
+    Object.assign(out, {
+      ok: true,
+      notes_access: "ok",
+      recently_deleted_folder: index.trash_name,
+      accounts: index.accounts.map((a) => ({ name: a.name, default: a.default,
+        folders: index.folders.filter((f) => f.account === a.name).length,
+        notes: count((n) => n.account === a.name) })),
+      notes: { total: index.notes.length, visible: count((n) => !n.locked && !n.hidden && !n.trash),
+        locked: count((n) => n.locked), hidden_private_tag: count((n) => n.private),
+        hidden_excluded_folder: count((n) => n.excluded), in_recently_deleted: count((n) => n.trash) },
+      unmatched_exclusions: EXCLUDE_RAW.filter((x) => !index.folders.some((f) => norm(f.name) === norm(x))),
+    });
+  } catch (e) {
+    out.notes_access = "failed";
+    out.error = e.message;
+  }
+  return out;
 }
 
 // ---------- MCP server (JSON-RPC 2.0, newline-delimited over stdio) ----------
@@ -403,7 +494,7 @@ const TOOLS = [
       type: "object",
       properties: {
         id: { type: "string", description: "Note id from search_notes." },
-        title: { type: "string", description: "Used when id is not given; reads the best title match." },
+        title: { type: "string", description: "Used when id is not given; reads the best title match. Refused with a list of ids if two notes match equally well." },
         format: { type: "string", enum: ["markdown", "text", "html"], default: "markdown" },
         max_images: { type: "integer", minimum: 0, maximum: 20, default: 5, description: "How many of the note's images to return, in order. 0 for none." },
       },
@@ -426,7 +517,7 @@ const TOOLS = [
       properties: {
         title: { type: "string", description: "Note title. It becomes the first line." },
         content: { type: "string", description: "Note body in Markdown, without the title." },
-        folder: { type: "string", description: "Exact folder name (case-insensitive). Default: the default Notes folder." },
+        folder: { type: "string", description: "Folder name or full path such as Work/Clients (case-insensitive). If the name exists in more than one place, pass the path or account. Default: the default Notes folder." },
         account: { type: "string", description: "Account name, e.g. iCloud or On My Mac. Default: the default account." },
       },
       required: ["title"],
@@ -448,9 +539,16 @@ const TOOLS = [
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
+  {
+    name: "health",
+    title: "Check Apple Notes access",
+    description: "Check that this plugin can reach Apple Notes. Call it when a search returns nothing that should exist, or when a call fails. Reports macOS permission status, accounts, note counts, and how many notes are hidden by the owner's privacy settings.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
 ];
 
-const HANDLERS = { search_notes: searchNotes, get_note: getNote, list_folders: listFolders, create_note: createNote, update_note: updateNote };
+const HANDLERS = { search_notes: searchNotes, get_note: getNote, list_folders: listFolders, create_note: createNote, update_note: updateNote, health };
 
 async function handle(msg) {
   const { id, method, params = {} } = msg;
@@ -458,7 +556,7 @@ async function handle(msg) {
     case "initialize": {
       const v = PROTOCOLS.includes(params.protocolVersion) ? params.protocolVersion : PROTOCOLS[0];
       return { protocolVersion: v, capabilities: { tools: {} }, serverInfo: SERVER,
-        instructions: "Find notes with search_notes (titles and text), then read one with get_note using the returned id. list_folders shows where notes live. Write with create_note or update_note (needs the id). Notes cannot be deleted." };
+        instructions: "Find notes with search_notes (titles and text), then read one with get_note using the returned id. list_folders shows where notes live. Write with create_note or update_note (needs the id). Notes cannot be deleted. If a note you expect is missing, call health. The owner hides some notes on purpose (#private tag, excluded folders): never try to reach a hidden note another way, such as reading the Notes database or running osascript." };
     }
     case "ping": return {};
     case "tools/list": return { tools: TOOLS };
@@ -502,10 +600,12 @@ const HELP = `Apple Notes for AI tools (macOS)
   apple-notes-plugin search [query] [--limit N] [--folder NAME] [--titles-only] [--deleted]
   apple-notes-plugin get <id-or-title> [--format markdown|text|html] [--max-images N]
   apple-notes-plugin folders
-  apple-notes-plugin create <title> [--content MARKDOWN] [--folder NAME] [--account NAME]
+  apple-notes-plugin create <title> [--content MARKDOWN] [--folder NAME|PATH] [--account NAME]
   apple-notes-plugin update <id> --content MARKDOWN [--mode append|replace]
+  apple-notes-plugin health
 
 Search matches titles first, then note text. --content - reads Markdown from stdin.
+Notes tagged #private, and folders listed in APPLE_NOTES_EXCLUDE, are hidden.
 No delete. Output is JSON.`;
 
 async function cli(argv) {
@@ -523,6 +623,7 @@ async function cli(argv) {
   else if (cmd === "update") out = await updateNote({ ...flags, id: pos[0] });
   else if (cmd === "search") out = await searchNotes({ ...flags, query: pos.join(" "), limit: flags.limit ? +flags.limit : 20 });
   else if (cmd === "folders") out = await listFolders();
+  else if (cmd === "health") out = await health();
   else if (cmd === "get") {
     const arg = pos.join(" ");
     const { images, ...note } = await getNote({ format: flags.format, max_images: flags["max-images"] ?? 5,
