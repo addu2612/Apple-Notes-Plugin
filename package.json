@@ -1,0 +1,18 @@
+{
+  "name": "apple-notes-plugin",
+  "version": "0.1.0",
+  "description": "Let any AI assistant search, read and write Apple Notes. MCP server and CLI, zero dependencies, no delete.",
+  "license": "MIT",
+  "author": "Arnav Panicker",
+  "type": "module",
+  "main": "server.js",
+  "bin": { "apple-notes-plugin": "server.js" },
+  "files": ["server.js", "docs/*.md"],
+  "scripts": { "start": "node server.js" },
+  "keywords": ["apple-notes", "mcp", "model-context-protocol", "claude-code", "cursor", "codex", "macos"],
+  "repository": { "type": "git", "url": "git+https://github.com/addu2612/Apple-Notes-Plugin.git" },
+  "homepage": "https://github.com/addu2612/Apple-Notes-Plugin#readme",
+  "bugs": { "url": "https://github.com/addu2612/Apple-Notes-Plugin/issues" },
+  "os": ["darwin"],
+  "engines": { "node": ">=18" }
+}
