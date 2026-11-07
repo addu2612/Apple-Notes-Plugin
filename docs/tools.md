@@ -7,8 +7,12 @@
 | [`list_folders`](#list_folders) | Lists every folder and how many notes it holds            |       No       |
 | [`create_note`](#create_note)   | Creates a new note from Markdown                          |      Yes       |
 | [`update_note`](#update_note)   | Adds to the end of a note, or replaces its content        |      Yes       |
+| [`health`](#health)             | Checks access to Notes and counts notes                   |       No       |
 
 There is no delete tool, on purpose.
+
+Notes you hide (tagged `#private`, or in a folder listed in `APPLE_NOTES_EXCLUDE`) are invisible to every tool.
+See [Keep notes away from your AI](../README.md#keep-notes-away-from-your-ai).
 
 ## `search_notes`
 
@@ -38,7 +42,7 @@ When the query is not empty, each result has `matched_in`, either `title` or `te
 Text matches also have a `snippet`: about 160 characters around the match, so your AI can tell whether the note is worth opening without reading all of it.
 
 Searching text is fast, because the plugin reads the text of a whole folder in one call to Notes.
-On a library of about 270 notes, a search takes about half a second.
+On a library of about 270 notes, a search takes under a second.
 Locked notes never appear, and their contents are never shown to your AI.
 
 ## `get_note`
@@ -46,7 +50,7 @@ Locked notes never appear, and their contents are never shown to your AI.
 | Input    | Description                                             |
 | -------- | ------------------------------------------------------- |
 | `id`     | Note id from `search_notes`. Exact.                     |
-| `title`  | Used when there is no `id`. Reads the best title match. |
+| `title`  | Used when there is no `id`. Reads the best title match. If two or more notes match equally well, nothing is read: the error lists their ids, folders and dates, so your AI can pick one. |
 | `format` | `markdown` (default), `text` or `html`                  |
 | `max_images` | How many of the note's images to return, in order. Default `5`, maximum `20`, `0` for none. |
 
@@ -73,8 +77,12 @@ Returns every folder in every account, with:
 | --------- | --------------------------------------------------------------- |
 | `title`   | **Required.** Becomes the first line of the note.               |
 | `content` | Body in Markdown. Can include [images](#adding-images).         |
-| `folder`  | Folder name. Default: your default Notes folder.                |
+| `folder`  | Folder name, or a full path such as `Work/Clients`. Default: your default Notes folder. |
 | `account` | Account name, such as `iCloud`. Default: your default account.  |
+
+If the folder name exists in more than one place, for example *Notes* in both iCloud and On My Mac, the note is not created.
+The error lists each match.
+Pass `account`, or the full path as `folder`.
 
 ## `update_note`
 
@@ -85,6 +93,27 @@ Returns every folder in every account, with:
 | `mode`    | `append` (default) adds to the end. `replace` replaces everything under the title.   |
 
 Before each edit, the old note is saved to `~/.apple-notes-mcp/backups/`. To restore one, open the `.html` file in a browser and copy the content back into Notes.
+
+## `health`
+
+Takes no input.
+Call it when a search returns nothing that should exist, or when a call fails.
+Every failure looks the same from outside, "no results", and `health` tells them apart.
+
+| Field                       | Description                                                                 |
+| --------------------------- | --------------------------------------------------------------------------- |
+| `ok`, `notes_access`        | Whether the plugin can reach Notes. On failure, `error` says what to fix.   |
+| `accounts`                  | Each account, with its visible folder and note counts, and which is the default. |
+| `notes`                     | Totals: `visible`, `locked`, `hidden_private_tag`, `hidden_excluded_folder`, `in_recently_deleted`. |
+| `excluded_folder_count`     | How many folder names `APPLE_NOTES_EXCLUDE` lists.                          |
+| `unmatched_exclusion_count` | How many of those names match no folder. Usually a typo.                    |
+| `recently_deleted_folder`   | The name of *Recently Deleted* in your macOS language.                      |
+| `version`, `node`, `backups` | Plugin version, Node.js version, and the backup folder.                 |
+
+Your AI sees only counts, because a folder's name can be private on its own.
+The `health` command in a terminal also lists `excluded_folders` and `unmatched_exclusions` by name.
+
+`health` never fails itself. A problem shows up in its result, not as an error.
 
 ## Adding images
 
@@ -127,6 +156,7 @@ npx -y apple-notes-plugin search "launch plan" --limit 5
 npx -y apple-notes-plugin search "" --folder Work                 # recent notes in "Work"
 npx -y apple-notes-plugin search "invoice" --titles-only          # skip the text inside notes
 npx -y apple-notes-plugin folders                                 # every folder, with note counts
+npx -y apple-notes-plugin health                                  # access check and note counts
 npx -y apple-notes-plugin get "launch plan"                       # best title match, as Markdown
 npx -y apple-notes-plugin get "x-coredata://…/ICNote/p123" --format text
 npx -y apple-notes-plugin create "Deploy checklist" --content "- run migrations

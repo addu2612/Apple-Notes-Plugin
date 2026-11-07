@@ -1,6 +1,6 @@
 {
   "name": "apple-notes-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Let any AI assistant search, read and write Apple Notes. MCP server and CLI, zero dependencies, no delete.",
   "license": "MIT",
   "author": "Arnav Panicker",
